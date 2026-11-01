@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { MILESTONE_STATUS, PROJECT_STATUS, connect, eth, revertReason, short } from "./lib/chain";
+import { MILESTONE_STATUS, PROJECT_STATUS, connect, duration, eth, revertReason, short } from "./lib/chain";
 import CreateProject from "./components/CreateProject";
 import ProjectCard from "./components/ProjectCard";
 import { Toasts } from "./components/ui";
@@ -15,7 +15,7 @@ export default function App() {
   const [connError, setConnError] = useState("");
   const [me, setMe] = useState(null);
   const [projects, setProjects] = useState([]);
-  const [stats, setStats] = useState({ escrow: 0n, platform: 0n, owner: null });
+  const [stats, setStats] = useState({ escrow: 0n, platform: 0n, owner: null, window: 0 });
   const [panel, setPanel] = useState([]); // [{ address, bond, openCases }]
   const [balances, setBalances] = useState({});
   const [toasts, setToasts] = useState([]);
@@ -124,11 +124,12 @@ export default function App() {
         };
       })
     );
-    const [escrow, platform, owner, panelAddrs] = await Promise.all([
+    const [escrow, platform, owner, panelAddrs, responseWindow] = await Promise.all([
       web3.eth.getBalance(address),
       m.platformBalance().call(),
       m.owner().call(),
       m.getPanel().call(),
+      m.responseWindow().call(),
     ]);
     const panelInfo = await Promise.all(
       panelAddrs.map(async (a) => ({
@@ -140,19 +141,22 @@ export default function App() {
     const addrs = [...new Set([...(conn.accounts || []).slice(0, 6), ...(me ? [me] : [])])];
     const bals = Object.fromEntries(await Promise.all(addrs.map(async (a) => [a.toLowerCase(), BigInt(await web3.eth.getBalance(a))])));
     setProjects(list);
-    setStats({ escrow: BigInt(escrow), platform: BigInt(platform), owner });
+    setStats({ escrow: BigInt(escrow), platform: BigInt(platform), owner, window: Number(responseWindow) });
     setPanel(panelInfo);
     setBalances(bals);
   }, [conn, me]);
 
   useEffect(() => {
     refresh().catch((e) => setConnError(e.message));
-    const t = setInterval(() => {
-      setNow(Math.floor(Date.now() / 1000));
-      refresh().catch(() => {});
-    }, 3000);
+    const t = setInterval(() => refresh().catch(() => {}), 3000);
     return () => clearInterval(t);
   }, [refresh]);
+
+  // Separate 1-second tick so dispute countdowns move smoothly
+  useEffect(() => {
+    const t = setInterval(() => setNow(Math.floor(Date.now() / 1000)), 1000);
+    return () => clearInterval(t);
+  }, []);
 
   // ── Transactions ────────────────────────────────────────────────────
   const toast = (t) => {
@@ -171,8 +175,18 @@ export default function App() {
       const call = build(conn.contract);
       const opts = { from: me, ...(value ? { value: value.toString() } : {}) };
       // Estimate first: catches reverts with a readable reason and avoids Ganache's 90k default gas
-      const gas = await call.estimateGas(opts);
-      const receipt = await call.send({ ...opts, gas: ((BigInt(gas) * 12n) / 10n).toString() });
+      let gas;
+      try {
+        gas = ((BigInt(await call.estimateGas(opts)) * 12n) / 10n).toString();
+      } catch (e) {
+        // Ganache simulates on the last mined block's timestamp. If no block was mined since
+        // the dispute, deadline checks ("… still open") fail in the estimate even though the
+        // deadline has passed. The real transaction gets a new block with the current time,
+        // so send it anyway with a fixed gas limit.
+        if (!/still open/i.test(revertReason(e))) throw e;
+        gas = "1000000";
+      }
+      const receipt = await call.send({ ...opts, gas });
       dismiss(pending);
       toast({ kind: "ok", title, body: `Mined in block ${receipt.blockNumber}` });
       await refresh();
@@ -303,7 +317,7 @@ export default function App() {
                 </div>
               )}
               <ArbitratorPanel panel={panel} me={me} act={act} nameOf={nameOf} />
-              <FeeModel />
+              <FeeModel windowSecs={stats.window} />
             </aside>
 
             <section className="feed">
@@ -328,7 +342,7 @@ export default function App() {
                 </div>
               )}
               {shown.map((p) => (
-                <ProjectCard key={p.id} project={p} me={me} act={act} now={now} nameOf={nameOf} />
+                <ProjectCard key={p.id} project={p} me={me} act={act} now={now} windowSecs={stats.window} nameOf={nameOf} />
               ))}
             </section>
           </main>
@@ -353,7 +367,7 @@ function Stat({ label, value, sub, tone, children }) {
   );
 }
 
-function FeeModel() {
+function FeeModel({ windowSecs }) {
   return (
     <div className="card fees">
       <h2>Economics</h2>
@@ -376,6 +390,13 @@ function FeeModel() {
       <div className="fee-line">
         <span className="fee-badge">0.1</span>
         <span>ETH slashed from an arbitrator's bond for voting against the majority or not voting in time</span>
+      </div>
+      <div className="fee-line">
+        <span className="fee-badge">⏱</span>
+        <span>
+          <b>{windowSecs ? duration(windowSecs) : "…"}</b> for the other side to counter-stake, then another{" "}
+          <b>{windowSecs ? duration(windowSecs) : "…"}</b> for the panel to vote
+        </span>
       </div>
       <p className="muted small">
         Winner always gets their stake back. No response in time → disputer wins by default. No 2-vote majority in time → respondent wins.

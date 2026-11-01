@@ -69,6 +69,21 @@ export function revertReason(err) {
   return msg.length > 160 ? msg.slice(0, 160) + "…" : msg;
 }
 
+/** 120 → "2 min", 90 → "1 min 30 s", 3600 → "1 h" */
+export function duration(secs) {
+  const s = Math.max(0, Math.round(Number(secs)));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const r = s % 60;
+  return [h && `${h} h`, m && `${m} min`, r && `${r} s`].filter(Boolean).join(" ") || "0 s";
+}
+
+/** 95 → "1:35" */
+export const clock = (secs) => {
+  const s = Math.max(0, Math.floor(secs));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+};
+
 export const short = (a) => (a ? `${a.slice(0, 6)}…${a.slice(-4)}` : "");
 export const shortHash = (h) => (h && !/^0x0+$/.test(h) ? `${h.slice(0, 10)}…${h.slice(-8)}` : "—");
 

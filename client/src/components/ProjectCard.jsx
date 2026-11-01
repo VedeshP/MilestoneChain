@@ -4,6 +4,8 @@ import {
   ARBITRATOR_FEE_BPS,
   PLATFORM_FEE_BPS,
   STAKE_BPS,
+  clock,
+  duration,
   eth,
   pct,
   short,
@@ -12,7 +14,7 @@ import { Hash, HashInput, Pill } from "./ui";
 
 const same = (a, b) => a && b && a.toLowerCase() === b.toLowerCase();
 
-export default function ProjectCard({ project: p, me, act, now, nameOf }) {
+export default function ProjectCard({ project: p, me, act, now, windowSecs, nameOf }) {
   const [open, setOpen] = useState(p.status === "Active" || p.status === "Disputed");
   const isClient = same(me, p.client);
   const isDev = same(me, p.developer);
@@ -66,12 +68,12 @@ export default function ProjectCard({ project: p, me, act, now, nameOf }) {
           </div>
 
           {p.dispute.open && (
-            <DisputePanel p={p} me={me} act={act} now={now} nameOf={nameOf} />
+            <DisputePanel p={p} me={me} act={act} now={now} windowSecs={windowSecs} nameOf={nameOf} />
           )}
 
           <div className="milestones">
             {p.milestones.map((m) => (
-              <MilestoneRow key={m.idx} p={p} m={m} isClient={isClient} isDev={isDev} act={act} />
+              <MilestoneRow key={m.idx} p={p} m={m} isClient={isClient} isDev={isDev} act={act} windowSecs={windowSecs} />
             ))}
           </div>
 
@@ -103,7 +105,7 @@ function Party({ role, addr, me, nameOf }) {
   );
 }
 
-function MilestoneRow({ p, m, isClient, isDev, act }) {
+function MilestoneRow({ p, m, isClient, isDev, act, windowSecs }) {
   const [panel, setPanel] = useState(null); // "submit" | "verify" | "dispute"
   const [artifact, setArtifact] = useState(null);
   const [artifactName, setArtifactName] = useState("");
@@ -263,7 +265,11 @@ function MilestoneRow({ p, m, isClient, isDev, act }) {
             </div>
             <div className="muted small">
               Returned if you win. If you lose it is slashed: {eth(pct(m.amount, ARBITRATOR_FEE_BPS), 6)} ETH to the arbitrator, the rest to the
-              platform. If the other side doesn't counter-stake in time, you win by default.
+              platform.
+            </div>
+            <div className="window-note">
+              ⏱ The other side then has <b>{duration(windowSecs)}</b> to counter-stake — if they don't, you win by default. After that the
+              panel has another <b>{duration(windowSecs)}</b> to vote.
             </div>
           </div>
           <button className="btn danger" disabled={!reason.trim()} onClick={doDispute}>
@@ -277,11 +283,10 @@ function MilestoneRow({ p, m, isClient, isDev, act }) {
 
 const VOTE_LABEL = ["Not voted", "Developer", "Client"];
 
-function DisputePanel({ p, me, act, now, nameOf }) {
+function DisputePanel({ p, me, act, now, windowSecs, nameOf }) {
   const d = p.dispute;
   const m = p.milestones[d.milestoneIndex];
   const left = d.deadline - now;
-  const clock = `${Math.floor(Math.max(left, 0) / 60)}:${String(Math.max(left, 0) % 60).padStart(2, "0")}`;
   const isDisputer = same(me, d.disputer);
   const isRespondent = same(me, d.respondent);
   const disputerIsClient = same(d.disputer, p.client);
@@ -330,20 +335,9 @@ function DisputePanel({ p, me, act, now, nameOf }) {
             Raised by <b>{nameOf(d.disputer) || short(d.disputer)}</b> · “{d.reason}”
           </div>
         </div>
-        <div className="dispute-clock">
-          {!d.responded ? (
-            left > 0 ? (
-              <span className="tag tone-amber">Respondent has {clock} to counter-stake</span>
-            ) : (
-              <span className="tag tone-red">Response window closed — default win available</span>
-            )
-          ) : left > 0 ? (
-            <span className="tag tone-purple">Panel voting · {clock} left</span>
-          ) : (
-            <span className="tag tone-red">Voting closed without a majority</span>
-          )}
-        </div>
       </div>
+
+      <DisputeTimer responded={d.responded} left={left} windowSecs={windowSecs} deadline={d.deadline} />
 
       <div className="evidence">
         <Hash value={m.artifactHash} label="registered" />
@@ -405,3 +399,52 @@ const Row = ({ k, v, bad }) => (
     <span className="mono">{v}</span>
   </div>
 );
+
+/** Two-phase timeline: 1) respondent counter-stakes, 2) panel votes — with a live countdown. */
+function DisputeTimer({ responded, left, windowSecs, deadline }) {
+  const expired = left <= 0;
+  const phase = responded ? 2 : 1;
+  const fill = windowSecs ? Math.min(100, Math.max(0, (left / windowSecs) * 100)) : 0;
+  const tone = expired ? "red" : phase === 1 || left <= 30 ? "amber" : "purple";
+
+  const label = !responded
+    ? expired
+      ? "Response window closed — the disputer can claim a default win"
+      : "Waiting for the respondent to counter-stake"
+    : expired
+      ? "Voting closed without a 2-vote majority — anyone can finalize"
+      : "Arbitrator panel is voting";
+
+  const step = (n, text) => {
+    const state = phase > n ? "done" : phase === n ? (expired ? "expired" : "active") : "next";
+    return (
+      <div className={`tl-step tl-${state}`}>
+        <span className="tl-num">{state === "done" ? "✓" : n}</span>
+        <span>
+          {text}
+          <span className="muted small"> · {duration(windowSecs)}</span>
+        </span>
+      </div>
+    );
+  };
+
+  return (
+    <div className={`timer timer-${tone}`}>
+      <div className="tl">
+        {step(1, "Counter-stake")}
+        <span className="tl-line" />
+        {step(2, "Panel vote")}
+      </div>
+      <div className="timer-main">
+        <div>
+          <div className="timer-label">{label}</div>
+          <div className="muted small">Deadline {new Date(deadline * 1000).toLocaleTimeString()}</div>
+        </div>
+        <div className="timer-clock">{clock(left)}</div>
+      </div>
+      <div className="timer-bar">
+        <div style={{ width: `${expired ? 0 : fill}%` }} />
+      </div>
+    </div>
+  );
+}

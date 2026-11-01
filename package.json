@@ -1,0 +1,17 @@
+{
+  "name": "milestonechain",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Milestone escrow with verifiable software deliverables, staked disputes and platform fees",
+  "scripts": {
+    "ganache": "ganache --server.port 7545 --chain.chainId 1337 --chain.networkId 5777 --wallet.deterministic --wallet.totalAccounts 10 --wallet.defaultBalance 100",
+    "compile": "truffle compile",
+    "migrate": "truffle migrate --reset --network development",
+    "test": "truffle test --network development",
+    "client": "npm --prefix client run dev"
+  },
+  "devDependencies": {
+    "ganache": "^7.9.2",
+    "truffle": "^5.11.5"
+  }
+}

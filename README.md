@@ -1,5 +1,6 @@
 # MilestoneChain
 <<<<<<< HEAD
+<<<<<<< HEAD
 
 Milestone escrow for software projects. ETH is released only after the client checks that the file they received has the same SHA-256 hash the developer registered on-chain. Disputes are staked: the loser pays.
 
@@ -62,6 +63,9 @@ The dispute response window is set in `migrations/1_deploy_milestone_escrow.js` 
 7. **Arbitrator**: the panel shows the payout for both outcomes. Rule for one side, and the loser's stake is split 1% to the arbitrator and the rest to the platform.
 8. **Platform** (account 0): withdraw the accumulated fees.
 9. **Client**: create a second project and use Cancel & refund before anything is submitted. The full amount comes back.
+=======
+Blockchain project
+>>>>>>> 21905fb1a110af682b1c8411ce6c39394a30e0c9
 =======
 Blockchain project
 >>>>>>> 21905fb1a110af682b1c8411ce6c39394a30e0c9

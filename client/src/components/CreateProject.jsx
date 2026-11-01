@@ -9,7 +9,6 @@ export default function CreateProject({ people, me, onCreate, busy }) {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [developer, setDeveloper] = useState(people.find((p) => p.role === "Developer")?.address || "");
-  const [arbitrator, setArbitrator] = useState(people.find((p) => p.role === "Arbitrator")?.address || "");
   const [rows, setRows] = useState([
     { desc: "Frontend UI", amount: "0.5" },
     { desc: "Backend API", amount: "0.5" },
@@ -35,23 +34,15 @@ export default function CreateProject({ people, me, onCreate, busy }) {
     setError("");
     if (!name.trim()) return setError("Give the project a name.");
     if (!Web3.utils.isAddress(developer)) return setError("Developer address is invalid.");
-    if (!Web3.utils.isAddress(arbitrator)) return setError("Arbitrator address is invalid.");
     if (rows.some((r) => !r.desc.trim())) return setError("Every milestone needs a description.");
     if (!amountsOk) return setError("Every milestone needs a positive ETH amount.");
     const amounts = rows.map((r) => Web3.utils.toWei(r.amount, "ether"));
-    const ok = await onCreate(name.trim(), description.trim(), developer, arbitrator, rows.map((r) => r.desc.trim()), amounts, total);
+    const ok = await onCreate(name.trim(), description.trim(), developer, rows.map((r) => r.desc.trim()), amounts, total);
     if (ok) {
       setName("");
       setDescription("");
     }
   };
-
-  const AddressField = ({ label, value, onChange, listId }) => (
-    <label className="field">
-      <span>{label}</span>
-      <input list={listId} value={value} onChange={(e) => onChange(e.target.value)} placeholder="0x…" spellCheck={false} />
-    </label>
-  );
 
   return (
     <form className="card create" onSubmit={submit}>
@@ -77,10 +68,11 @@ export default function CreateProject({ people, me, onCreate, busy }) {
           </option>
         ))}
       </datalist>
-      <div className="grid2">
-        {AddressField({ label: "Developer", value: developer, onChange: setDeveloper, listId: "people" })}
-        {AddressField({ label: "Arbitrator", value: arbitrator, onChange: setArbitrator, listId: "people" })}
-      </div>
+      <label className="field">
+        <span>Developer</span>
+        <input list="people" value={developer} onChange={(e) => setDeveloper(e.target.value)} placeholder="0x…" spellCheck={false} />
+      </label>
+      <p className="muted small field-note">Disputes go to the 3-member arbitrator panel — no need to pick one.</p>
 
       <div className="ms-editor">
         <div className="ms-editor-head">

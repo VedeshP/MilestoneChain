@@ -13,10 +13,21 @@ pragma solidity ^0.8.19;
  *  • Dispute stake  5%   of the milestone — posted by BOTH sides ("loser pays")
  *      - disputer posts it in raiseDispute()
  *      - the other party posts it in respondToDispute() to contest
- *      - if they don't respond within responseWindow, disputer wins by default
- *  • Arbitrator fee 1%   of the milestone — paid out of the LOSER's slashed stake
+ *      - if they don't respond within the window, disputer wins by default
+ *  • Arbitrator fee 1%   of the milestone — paid out of the LOSER's slashed stake,
+ *                        split between the arbitrators who voted for the outcome
  *  • Slashed stake remainder (5% − 1% = 4%) → platform
  *  • Winner's stake is returned in full
+ *
+ *  Arbitrator panel (keeps arbitrators honest)
+ *  ───────────────────────────────────────────
+ *  • 3 arbitrators each lock a 1 ETH bond to join the panel
+ *  • Every dispute is voted on by all 3 — 2 matching votes decide it
+ *  • Voting against the final outcome, or not voting before the deadline,
+ *    slashes 0.1 ETH from the arbitrator's bond (→ platform)
+ *  • A bond below 0.5 ETH removes the arbitrator from the panel
+ *  • No 2-vote majority by the deadline → the respondent wins
+ *    (the disputer has to convince the panel)
  *
  * @dev BCT Final Lab Project — MilestoneChain
  */
@@ -26,6 +37,7 @@ contract MilestoneEscrow {
     enum ProjectStatus   { Active, Completed, Disputed, Cancelled }
     enum MilestoneStatus { Pending, Submitted, Verified, Approved, Disputed, Refunded }
     enum ArtifactType    { BuildOutput, ZipArchive, CommitHash, DockerImage, Other }
+    enum Vote            { None, ForDeveloper, ForClient }
 
     // ─── Structs ──────────────────────────────────────────────────────────
     struct Milestone {
@@ -35,7 +47,7 @@ contract MilestoneEscrow {
         string          artifactName;   // human-readable artifact identifier
         ArtifactType    artifactType;
         bool            isVerified;     // set to true by verifyDeliverable()
-        bytes32         clientHash;     // last hash the client checked (evidence for arbitrator)
+        bytes32         clientHash;     // last hash the client checked (evidence for arbitrators)
         MilestoneStatus status;
         uint256         submittedAt;
     }
@@ -46,7 +58,6 @@ contract MilestoneEscrow {
         string          description;
         address payable client;
         address payable developer;
-        address payable arbitrator;
         uint256         totalAmount;
         uint256         releasedAmount;   // gross amount settled to developer (incl. fees)
         uint256         refundedAmount;   // gross amount returned to client  (incl. fees)
@@ -57,31 +68,45 @@ contract MilestoneEscrow {
     }
 
     struct Dispute {
-        uint256         milestoneIndex;
-        address payable disputer;
-        address payable respondent;
-        uint256         stake;            // stake per side
-        bool            responded;        // respondent posted counter-stake
-        uint256         deadline;         // respondent must respond before this
-        string          reason;
-        bool            open;
+        uint256            milestoneIndex;
+        address payable    disputer;
+        address payable    respondent;
+        uint256            stake;          // stake per side
+        bool               responded;      // respondent posted counter-stake
+        uint256            deadline;       // response deadline, then voting deadline
+        string             reason;
+        bool               open;
+        address payable[3] arbitrators;    // panel snapshot taken when the dispute was raised
+        Vote[3]            votes;
+        uint256            devVotes;
+        uint256            clientVotes;
     }
 
-    // ─── Constants (basis points, 10 000 = 100%) ──────────────────────────
-    uint256 public constant BPS               = 10_000;
-    uint256 public constant PLATFORM_FEE_BPS  = 50;    // 0.5%
-    uint256 public constant ARBITRATOR_FEE_BPS = 100;  // 1%
-    uint256 public constant STAKE_BPS         = 500;   // 5%
+    // ─── Constants ────────────────────────────────────────────────────────
+    uint256 public constant BPS                = 10_000; // basis points, 10 000 = 100%
+    uint256 public constant PLATFORM_FEE_BPS   = 50;     // 0.5%
+    uint256 public constant ARBITRATOR_FEE_BPS = 100;    // 1%
+    uint256 public constant STAKE_BPS          = 500;    // 5%
+
+    uint256 public constant PANEL_SIZE         = 3;
+    uint256 public constant MAJORITY           = 2;
+    uint256 public constant ARBITRATOR_BOND    = 1 ether;
+    uint256 public constant MIN_BOND           = 0.5 ether;
+    uint256 public constant ARBITRATOR_SLASH   = 0.1 ether;
 
     // ─── State Variables ──────────────────────────────────────────────────
     address public owner;
     uint256 public projectCount;
     uint256 public platformBalance;      // accumulated, withdrawable by owner
-    uint256 public responseWindow;       // seconds the respondent has to counter-stake
+    uint256 public responseWindow;       // seconds to counter-stake, and again to vote
 
     mapping(uint256 => Project)                       public projects;
     mapping(uint256 => mapping(uint256 => Milestone)) public milestones;
-    mapping(uint256 => Dispute)                       public disputes;   // one open dispute per project
+    mapping(uint256 => Dispute)                       internal disputes;   // one open dispute per project
+
+    address payable[]           public panel;            // current arbitrators
+    mapping(address => uint256) public arbitratorBond;   // > 0 means on the panel
+    mapping(address => uint256) public openCases;        // open disputes an arbitrator sits on
 
     bool private locked;
 
@@ -92,7 +117,12 @@ contract MilestoneEscrow {
     event MilestoneApproved(uint256 indexed projectId, uint256 milestoneIndex, uint256 developerAmount, uint256 platformFee);
     event DisputeRaised(uint256 indexed projectId, uint256 milestoneIndex, address raisedBy, uint256 stake, string reason);
     event DisputeResponded(uint256 indexed projectId, uint256 milestoneIndex, address respondent, uint256 stake);
+    event VoteCast(uint256 indexed projectId, address indexed arbitrator, bool favorDeveloper);
     event DisputeResolved(uint256 indexed projectId, uint256 milestoneIndex, bool favorDeveloper, address winner, uint256 slashed, uint256 arbitratorFee, uint256 platformFee);
+    event ArbitratorJoined(address indexed arbitrator, uint256 bond);
+    event ArbitratorRewarded(uint256 indexed projectId, address indexed arbitrator, uint256 amount);
+    event ArbitratorSlashed(uint256 indexed projectId, address indexed arbitrator, uint256 amount);
+    event ArbitratorRemoved(address indexed arbitrator, uint256 bondReturned);
     event ProjectCompleted(uint256 indexed projectId);
     event ClientRefunded(uint256 indexed projectId, uint256 amount);
     event PlatformWithdrawn(address indexed to, uint256 amount);
@@ -110,11 +140,6 @@ contract MilestoneEscrow {
 
     modifier onlyDeveloper(uint256 _id) {
         require(msg.sender == projects[_id].developer,  "MilestoneChain: Not the developer");
-        _;
-    }
-
-    modifier onlyArbitrator(uint256 _id) {
-        require(msg.sender == projects[_id].arbitrator, "MilestoneChain: Not the arbitrator");
         _;
     }
 
@@ -142,8 +167,8 @@ contract MilestoneEscrow {
 
     // ─── Constructor ──────────────────────────────────────────────────────
     /**
-     * @param _responseWindow Seconds a respondent has to counter-stake a dispute
-     *                        (use a few minutes for demos, days in production).
+     * @param _responseWindow Seconds a respondent has to counter-stake a dispute, and
+     *                        then the arbitrators have to vote (minutes for demos, days in production).
      */
     constructor(uint256 _responseWindow) {
         require(_responseWindow > 0, "MilestoneChain: Window must be > 0");
@@ -160,6 +185,29 @@ contract MilestoneEscrow {
         return stakeOf(milestones[_projectId][_milestoneIndex].amount);
     }
 
+    // ─── Arbitrator panel ─────────────────────────────────────────────────
+    /// @notice Join the 3-seat arbitrator panel by locking a 1 ETH bond.
+    function joinPanel() external payable {
+        require(panel.length < PANEL_SIZE,        "MilestoneChain: Panel is full");
+        require(arbitratorBond[msg.sender] == 0,  "MilestoneChain: Already on the panel");
+        require(msg.value == ARBITRATOR_BOND,     "MilestoneChain: Bond must be exactly 1 ETH");
+
+        arbitratorBond[msg.sender] = msg.value;
+        panel.push(payable(msg.sender));
+        emit ArbitratorJoined(msg.sender, msg.value);
+    }
+
+    /// @notice Leave the panel and take the bond back — only with no open cases.
+    function leavePanel() external nonReentrant {
+        require(arbitratorBond[msg.sender] > 0, "MilestoneChain: Not on the panel");
+        require(openCases[msg.sender] == 0,     "MilestoneChain: Finish your open disputes first");
+        _removeFromPanel(payable(msg.sender));
+    }
+
+    function getPanel() external view returns (address payable[] memory) { return panel; }
+
+    function isArbitrator(address _a) public view returns (bool) { return arbitratorBond[_a] > 0; }
+
     // ─── 1. Create project ────────────────────────────────────────────────
     /**
      * @notice Client creates a project and locks ETH into the contract.
@@ -169,15 +217,13 @@ contract MilestoneEscrow {
         string   memory   _name,
         string   memory   _description,
         address  payable  _developer,
-        address  payable  _arbitrator,
         string[] memory   _milestoneDescs,
         uint256[] memory  _milestoneAmounts
     ) external payable returns (uint256) {
         require(bytes(_name).length > 0,                            "MilestoneChain: Name is empty");
         require(_developer != address(0),                           "MilestoneChain: Invalid developer address");
         require(_developer != msg.sender,                           "MilestoneChain: Client cannot be developer");
-        require(_arbitrator != address(0),                          "MilestoneChain: Invalid arbitrator address");
-        require(_arbitrator != msg.sender && _arbitrator != _developer, "MilestoneChain: Arbitrator must be neutral");
+        require(!isArbitrator(msg.sender) && !isArbitrator(_developer), "MilestoneChain: Arbitrators cannot be a party");
         require(_milestoneDescs.length > 0,                         "MilestoneChain: No milestones provided");
         require(_milestoneDescs.length == _milestoneAmounts.length, "MilestoneChain: Arrays length mismatch");
 
@@ -195,7 +241,6 @@ contract MilestoneEscrow {
         p.description    = _description;
         p.client         = payable(msg.sender);
         p.developer      = _developer;
-        p.arbitrator     = _arbitrator;
         p.totalAmount    = msg.value;
         p.milestoneCount = _milestoneDescs.length;
         p.status         = ProjectStatus.Active;
@@ -317,7 +362,8 @@ contract MilestoneEscrow {
         Project storage p = projects[_projectId];
         require(msg.sender == p.client || msg.sender == p.developer,
             "MilestoneChain: Only client or developer can raise a dispute");
-        require(bytes(_reason).length > 0, "MilestoneChain: Reason cannot be empty");
+        require(bytes(_reason).length > 0,  "MilestoneChain: Reason cannot be empty");
+        require(panel.length == PANEL_SIZE, "MilestoneChain: Arbitrator panel is not full");
 
         Milestone storage m = milestones[_projectId][_milestoneIndex];
         require(m.status == MilestoneStatus.Submitted, "MilestoneChain: Only a submitted, unverified milestone can be disputed");
@@ -325,20 +371,26 @@ contract MilestoneEscrow {
         uint256 stake = stakeOf(m.amount);
         require(msg.value == stake, "MilestoneChain: Must stake exactly 5% of milestone amount");
 
-        address payable respondent = msg.sender == p.client ? p.developer : p.client;
-
         m.status = MilestoneStatus.Disputed;
         p.status = ProjectStatus.Disputed;
-        disputes[_projectId] = Dispute({
-            milestoneIndex: _milestoneIndex,
-            disputer:       payable(msg.sender),
-            respondent:     respondent,
-            stake:          stake,
-            responded:      false,
-            deadline:       block.timestamp + responseWindow,
-            reason:         _reason,
-            open:           true
-        });
+
+        Dispute storage d = disputes[_projectId];
+        d.milestoneIndex = _milestoneIndex;
+        d.disputer       = payable(msg.sender);
+        d.respondent     = msg.sender == p.client ? p.developer : p.client;
+        d.stake          = stake;
+        d.responded      = false;
+        d.deadline       = block.timestamp + responseWindow;
+        d.reason         = _reason;
+        d.open           = true;
+        d.devVotes       = 0;
+        d.clientVotes    = 0;
+        for (uint256 i = 0; i < PANEL_SIZE; i++) {
+            require(panel[i] != p.client && panel[i] != p.developer, "MilestoneChain: A party sits on the arbitrator panel");
+            d.arbitrators[i] = panel[i];
+            d.votes[i]       = Vote.None;
+            openCases[panel[i]] += 1;
+        }
 
         emit DisputeRaised(_projectId, _milestoneIndex, msg.sender, stake, _reason);
     }
@@ -353,57 +405,62 @@ contract MilestoneEscrow {
         require(msg.value == d.stake,            "MilestoneChain: Must match the disputer's stake");
 
         d.responded = true;
+        d.deadline  = block.timestamp + responseWindow;   // voting window starts now
         emit DisputeResponded(_projectId, d.milestoneIndex, msg.sender, msg.value);
     }
 
-    // ─── 7. Arbitrator rules — loser's stake is slashed ───────────────────
-    /**
-     * @param _favorDeveloper true → developer gets the milestone | false → client refunded
-     */
-    function resolveDispute(uint256 _projectId, bool _favorDeveloper)
-        external
-        nonReentrant
-        projectExists(_projectId)
-        onlyArbitrator(_projectId)
-    {
+    // ─── 7. Arbitrators vote — 2 matching votes decide ────────────────────
+    function vote(uint256 _projectId, bool _favorDeveloper) external nonReentrant projectExists(_projectId) {
         Dispute storage d = disputes[_projectId];
-        require(d.open,      "MilestoneChain: No open dispute");
-        require(d.responded, "MilestoneChain: Respondent has not staked yet - wait or claim default");
+        require(d.open,                        "MilestoneChain: No open dispute");
+        require(d.responded,                   "MilestoneChain: Respondent has not staked yet");
+        require(block.timestamp <= d.deadline, "MilestoneChain: Voting closed - call finalizeDispute");
 
-        Project storage p = projects[_projectId];
-        address payable winner = _favorDeveloper ? p.developer : p.client;
-        Milestone storage m = milestones[_projectId][d.milestoneIndex];
+        uint256 seat = _seatOf(d, msg.sender);   // reverts if not on this dispute's panel
+        require(d.votes[seat] == Vote.None,    "MilestoneChain: Already voted");
 
-        // Loser's stake: 1% of milestone to arbitrator, remainder to platform
-        uint256 slashed  = d.stake;
-        uint256 arbFee   = arbitratorFeeOf(m.amount);
-        if (arbFee > slashed) arbFee = slashed;
-        platformBalance += slashed - arbFee;
+        if (_favorDeveloper) {
+            d.votes[seat] = Vote.ForDeveloper;
+            d.devVotes += 1;
+        } else {
+            d.votes[seat] = Vote.ForClient;
+            d.clientVotes += 1;
+        }
+        emit VoteCast(_projectId, msg.sender, _favorDeveloper);
 
-        uint256 milestoneFee = _closeDispute(_projectId, _favorDeveloper);
-
-        _send(winner, d.stake);              // winner's own stake back
-        _send(p.arbitrator, arbFee);
-
-        emit DisputeResolved(_projectId, d.milestoneIndex, _favorDeveloper, winner, slashed, arbFee, milestoneFee);
+        if (d.devVotes == MAJORITY)    _resolve(_projectId, true,  false);
+        if (d.clientVotes == MAJORITY) _resolve(_projectId, false, false);
     }
 
-    // ─── 8. Default win if respondent never counter-staked ────────────────
+    // ─── 8. No majority by the deadline → respondent wins ─────────────────
+    /// @notice Anyone can call this once voting has expired. Arbitrators who didn't vote are slashed.
+    function finalizeDispute(uint256 _projectId) external nonReentrant projectExists(_projectId) {
+        Dispute storage d = disputes[_projectId];
+        require(d.open,                       "MilestoneChain: No open dispute");
+        require(d.responded,                  "MilestoneChain: Respondent never staked - disputer can claim default");
+        require(block.timestamp > d.deadline, "MilestoneChain: Voting still open");
+
+        bool respondentIsDev = d.respondent == projects[_projectId].developer;
+        _resolve(_projectId, respondentIsDev, true);
+    }
+
+    // ─── 9. Default win if respondent never counter-staked ────────────────
     function claimDefault(uint256 _projectId) external nonReentrant projectExists(_projectId) {
         Dispute storage d = disputes[_projectId];
         require(d.open,                        "MilestoneChain: No open dispute");
         require(msg.sender == d.disputer,      "MilestoneChain: Only the disputer can claim");
-        require(!d.responded,                  "MilestoneChain: Respondent contested - arbitrator must decide");
+        require(!d.responded,                  "MilestoneChain: Respondent contested - arbitrators must decide");
         require(block.timestamp > d.deadline,  "MilestoneChain: Response window still open");
 
         bool favorDeveloper = d.disputer == projects[_projectId].developer;
-        uint256 milestoneFee = _closeDispute(_projectId, favorDeveloper);
+        for (uint256 i = 0; i < PANEL_SIZE; i++) openCases[d.arbitrators[i]] -= 1;  // panel never needed
+        uint256 milestoneFee = _payMilestone(_projectId, favorDeveloper);
 
-        _send(d.disputer, d.stake);          // stake back — nobody was slashed, arbitrator not involved
+        _send(d.disputer, d.stake);          // stake back — nobody was slashed
         emit DisputeResolved(_projectId, d.milestoneIndex, favorDeveloper, d.disputer, 0, 0, milestoneFee);
     }
 
-    // ─── 9. Client cancels — unused funds back (no fee) ───────────────────
+    // ─── 10. Client cancels — unused funds back (no fee) ──────────────────
     function refundClient(uint256 _projectId)
         external
         nonReentrant
@@ -431,7 +488,7 @@ contract MilestoneEscrow {
         emit ClientRefunded(_projectId, remaining);
     }
 
-    // ─── 10. Owner withdraws accumulated platform fees ────────────────────
+    // ─── 11. Owner withdraws accumulated platform fees ────────────────────
     function withdrawPlatformFees() external nonReentrant onlyOwner {
         uint256 amount = platformBalance;
         require(amount > 0, "MilestoneChain: Nothing to withdraw");
@@ -441,8 +498,44 @@ contract MilestoneEscrow {
     }
 
     // ─── Internal ─────────────────────────────────────────────────────────
-    /// @dev Pays the milestone (minus 0.5% fee) to the winning side and reopens the project.
-    function _closeDispute(uint256 _projectId, bool _favorDeveloper) internal returns (uint256 fee) {
+    /**
+     * @dev Settles a contested dispute.
+     *      - loser's stake is slashed: 1% of the milestone to the arbitrators who voted
+     *        for the outcome (split equally), the rest to the platform
+     *      - arbitrators who voted against the outcome are slashed; so are non-voters
+     *        when the dispute ended by timeout (_timedOut)
+     */
+    function _resolve(uint256 _projectId, bool _favorDeveloper, bool _timedOut) internal {
+        Dispute storage d = disputes[_projectId];
+        Project storage p = projects[_projectId];
+        address payable winner = _favorDeveloper ? p.developer : p.client;
+        Vote winningVote = _favorDeveloper ? Vote.ForDeveloper : Vote.ForClient;
+        uint256 winningVotes = _favorDeveloper ? d.devVotes : d.clientVotes;
+
+        uint256 arbFee = arbitratorFeeOf(milestones[_projectId][d.milestoneIndex].amount);
+        if (winningVotes == 0) arbFee = 0;                 // nobody earned it
+        uint256 share = winningVotes > 0 ? arbFee / winningVotes : 0;
+        platformBalance += d.stake - share * winningVotes; // slashed stake minus fees paid out
+
+        uint256 milestoneFee = _payMilestone(_projectId, _favorDeveloper);
+        _send(winner, d.stake);                            // winner's own stake back
+
+        for (uint256 i = 0; i < PANEL_SIZE; i++) {
+            address payable a = d.arbitrators[i];
+            openCases[a] -= 1;
+            if (d.votes[i] == winningVote) {
+                _send(a, share);
+                emit ArbitratorRewarded(_projectId, a, share);
+            } else if (d.votes[i] != Vote.None || _timedOut) {
+                _slashArbitrator(_projectId, a);
+            }
+        }
+
+        emit DisputeResolved(_projectId, d.milestoneIndex, _favorDeveloper, winner, d.stake, share * winningVotes, milestoneFee);
+    }
+
+    /// @dev Closes the dispute and pays the milestone (minus 0.5% fee) to the winning side.
+    function _payMilestone(uint256 _projectId, bool _favorDeveloper) internal returns (uint256 fee) {
         Dispute storage d = disputes[_projectId];
         Project storage p = projects[_projectId];
         Milestone storage m = milestones[_projectId][d.milestoneIndex];
@@ -468,6 +561,39 @@ contract MilestoneEscrow {
         }
     }
 
+    function _slashArbitrator(uint256 _projectId, address payable _a) internal {
+        uint256 cut = arbitratorBond[_a] < ARBITRATOR_SLASH ? arbitratorBond[_a] : ARBITRATOR_SLASH;
+        arbitratorBond[_a] -= cut;
+        platformBalance    += cut;
+        emit ArbitratorSlashed(_projectId, _a, cut);
+
+        if (arbitratorBond[_a] > 0 && arbitratorBond[_a] < MIN_BOND) {
+            _removeFromPanel(_a);
+        }
+    }
+
+    /// @dev Removes an arbitrator from the panel and returns what's left of their bond.
+    function _removeFromPanel(address payable _a) internal {
+        for (uint256 i = 0; i < panel.length; i++) {
+            if (panel[i] == _a) {
+                panel[i] = panel[panel.length - 1];
+                panel.pop();
+                break;
+            }
+        }
+        uint256 bond = arbitratorBond[_a];
+        arbitratorBond[_a] = 0;
+        _send(_a, bond);
+        emit ArbitratorRemoved(_a, bond);
+    }
+
+    function _seatOf(Dispute storage d, address _a) internal view returns (uint256) {
+        for (uint256 i = 0; i < PANEL_SIZE; i++) {
+            if (d.arbitrators[i] == _a) return i;
+        }
+        revert("MilestoneChain: Not an arbitrator on this dispute");
+    }
+
     function _settle(uint256 _projectId) internal {
         Project storage p = projects[_projectId];
         p.settledCount += 1;
@@ -488,14 +614,14 @@ contract MilestoneEscrow {
         external view projectExists(_projectId)
         returns (
             uint256 id, string memory name, string memory description,
-            address client, address developer, address arbitrator,
+            address client, address developer,
             uint256 totalAmount, uint256 releasedAmount, uint256 refundedAmount,
             uint256 milestoneCount, uint256 settledCount,
             ProjectStatus status, uint256 createdAt
         )
     {
         Project storage p = projects[_projectId];
-        return (p.id, p.name, p.description, p.client, p.developer, p.arbitrator,
+        return (p.id, p.name, p.description, p.client, p.developer,
                 p.totalAmount, p.releasedAmount, p.refundedAmount,
                 p.milestoneCount, p.settledCount, p.status, p.createdAt);
     }
@@ -514,16 +640,8 @@ contract MilestoneEscrow {
                 m.artifactType, m.isVerified, m.clientHash, m.status, m.submittedAt);
     }
 
-    function getDispute(uint256 _projectId)
-        external view projectExists(_projectId)
-        returns (
-            uint256 milestoneIndex, address disputer, address respondent, uint256 stake,
-            bool responded, uint256 deadline, string memory reason, bool open
-        )
-    {
-        Dispute storage d = disputes[_projectId];
-        return (d.milestoneIndex, d.disputer, d.respondent, d.stake,
-                d.responded, d.deadline, d.reason, d.open);
+    function getDispute(uint256 _projectId) external view projectExists(_projectId) returns (Dispute memory) {
+        return disputes[_projectId];
     }
 
     function getProjectCount() external view returns (uint256) { return projectCount; }

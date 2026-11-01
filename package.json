@@ -8,7 +8,9 @@
     "compile": "truffle compile",
     "migrate": "truffle migrate --reset --network development",
     "test": "truffle test --network development",
-    "client": "npm --prefix client run dev"
+    "client": "npm --prefix client run dev",
+    "ganache:test": "ganache --server.port 8545 --wallet.defaultBalance 100",
+    "test:cli": "truffle test --network test"
   },
   "devDependencies": {
     "ganache": "^7.9.2",

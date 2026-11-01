@@ -4,9 +4,10 @@ import CreateProject from "./components/CreateProject";
 import ProjectCard from "./components/ProjectCard";
 import { Toasts } from "./components/ui";
 
-// Ganache demo convention: account 0 deploys (platform owner), 1–3 play the roles
-const DEMO_ROLES = ["Platform", "Client", "Developer", "Arbitrator"];
-const ROLE_ICON = { Platform: "🏦", Client: "🧑‍💼", Developer: "👩‍💻", Arbitrator: "⚖️" };
+// Ganache demo convention: account 0 deploys (platform owner), 1–2 are the parties,
+// 3–5 are the arbitrator panel (the migration registers them)
+const DEMO_ROLES = ["Platform", "Client", "Developer", "Arbitrator 1", "Arbitrator 2", "Arbitrator 3"];
+const roleIcon = (role) => (role?.startsWith("Arbitrator") ? "⚖️" : { Platform: "🏦", Client: "🧑‍💼", Developer: "👩‍💻" }[role] || "");
 
 export default function App() {
   const [mode, setMode] = useState(() => localStorage.getItem("mc-mode") || "ganache");
@@ -15,6 +16,7 @@ export default function App() {
   const [me, setMe] = useState(null);
   const [projects, setProjects] = useState([]);
   const [stats, setStats] = useState({ escrow: 0n, platform: 0n, owner: null });
+  const [panel, setPanel] = useState([]); // [{ address, bond, openCases }]
   const [balances, setBalances] = useState({});
   const [toasts, setToasts] = useState([]);
   const [busy, setBusy] = useState(false);
@@ -33,7 +35,7 @@ export default function App() {
   const nameOf = useCallback(
     (addr) => {
       const p = people.find((x) => x.address.toLowerCase() === addr?.toLowerCase());
-      return p?.role ? `${ROLE_ICON[p.role] || ""} ${p.role}` : null;
+      return p?.role ? `${roleIcon(p.role)} ${p.role}` : null;
     },
     [people]
   );
@@ -80,7 +82,8 @@ export default function App() {
     const ids = Array.from({ length: count }, (_, i) => count - i); // newest first
     const list = await Promise.all(
       ids.map(async (id) => {
-        const [pr, dp] = await Promise.all([m.getProject(id).call(), m.getDispute(id).call()]);
+        const [pr, raw] = await Promise.all([m.getProject(id).call(), m.getDispute(id).call()]);
+        const dp = raw.arbitrators ? raw : raw[0]; // struct return
         const n = Number(pr.milestoneCount);
         const ms = await Promise.all(Array.from({ length: n }, (_, i) => m.getMilestone(id, i).call()));
         return {
@@ -89,7 +92,6 @@ export default function App() {
           description: pr.description,
           client: pr.client,
           developer: pr.developer,
-          arbitrator: pr.arbitrator,
           totalAmount: BigInt(pr.totalAmount),
           releasedAmount: BigInt(pr.releasedAmount),
           refundedAmount: BigInt(pr.refundedAmount),
@@ -116,19 +118,30 @@ export default function App() {
             deadline: Number(dp.deadline),
             reason: dp.reason,
             open: dp.open,
+            arbitrators: [...dp.arbitrators],
+            votes: [...dp.votes].map(Number), // 0 none · 1 developer · 2 client
           },
         };
       })
     );
-    const [escrow, platform, owner] = await Promise.all([
+    const [escrow, platform, owner, panelAddrs] = await Promise.all([
       web3.eth.getBalance(address),
       m.platformBalance().call(),
       m.owner().call(),
+      m.getPanel().call(),
     ]);
+    const panelInfo = await Promise.all(
+      panelAddrs.map(async (a) => ({
+        address: a,
+        bond: BigInt(await m.arbitratorBond(a).call()),
+        openCases: Number(await m.openCases(a).call()),
+      }))
+    );
     const addrs = [...new Set([...(conn.accounts || []).slice(0, 6), ...(me ? [me] : [])])];
     const bals = Object.fromEntries(await Promise.all(addrs.map(async (a) => [a.toLowerCase(), BigInt(await web3.eth.getBalance(a))])));
     setProjects(list);
     setStats({ escrow: BigInt(escrow), platform: BigInt(platform), owner });
+    setPanel(panelInfo);
     setBalances(bals);
   }, [conn, me]);
 
@@ -173,13 +186,14 @@ export default function App() {
     }
   };
 
-  const createProject = async (name, desc, dev, arb, descs, amounts, total) => {
-    const r = await act("Create project", (c) => c.methods.createProject(name, desc, dev, arb, descs, amounts), total);
+  const createProject = async (name, desc, dev, descs, amounts, total) => {
+    const r = await act("Create project", (c) => c.methods.createProject(name, desc, dev, descs, amounts), total);
     return !!r;
   };
 
   // ── Derived ─────────────────────────────────────────────────────────
-  const involved = (p) => [p.client, p.developer, p.arbitrator].some((a) => a.toLowerCase() === me?.toLowerCase());
+  const involved = (p) =>
+    [p.client, p.developer, ...p.dispute.arbitrators].some((a) => a.toLowerCase() === me?.toLowerCase());
   const shown = projects.filter((p) =>
     filter === "mine" ? involved(p) : filter === "disputed" ? p.status === "Disputed" : true
   );
@@ -231,9 +245,9 @@ export default function App() {
             <section className="role-switch">
               <span className="muted small">Acting as</span>
               <div className="role-cards">
-                {people.slice(0, 4).map((p) => (
+                {people.slice(0, 6).map((p) => (
                   <button key={p.address} className={`role-card ${p.address === me ? "on" : ""}`} onClick={() => setMe(p.address)}>
-                    <span className="role-icon">{ROLE_ICON[p.role]}</span>
+                    <span className="role-icon">{roleIcon(p.role)}</span>
                     <span className="role-text">
                       <b>{p.role}</b>
                       <span className="mono small">{short(p.address)}</span>
@@ -277,10 +291,10 @@ export default function App() {
               {(mode === "metamask" || meRole === "Client" || !meRole) && <CreateProject people={people} me={me} onCreate={createProject} busy={busy} />}
               {mode === "ganache" && meRole && meRole !== "Client" && (
                 <div className="card hint">
-                  <h2>{ROLE_ICON[meRole]} {meRole} view</h2>
+                  <h2>{roleIcon(meRole)} {meRole} view</h2>
                   <p className="muted">
                     {meRole === "Developer" && "Submit artifacts for your milestones. Their SHA-256 is registered on-chain so the client can verify exactly what you delivered."}
-                    {meRole === "Arbitrator" && "Rule on disputes once both sides have staked. You earn 1% of the milestone, paid from the loser's slashed stake."}
+                    {meRole.startsWith("Arbitrator") && "Vote on disputes once both sides have staked. 2 matching votes decide. Vote with the majority to share the 1% fee; vote against it or miss the deadline and 0.1 ETH of your bond is slashed."}
                     {meRole === "Platform" && "The deployer collects 0.5% of every payout and the remainder of slashed stakes. Withdraw from the stats bar above."}
                   </p>
                   <button className="btn ghost sm" onClick={() => setMe(people[1]?.address)}>
@@ -288,6 +302,7 @@ export default function App() {
                   </button>
                 </div>
               )}
+              <ArbitratorPanel panel={panel} me={me} act={act} nameOf={nameOf} />
               <FeeModel />
             </aside>
 
@@ -352,13 +367,63 @@ function FeeModel() {
       </div>
       <div className="fee-line">
         <span className="fee-badge">1%</span>
-        <span>Arbitrator fee, paid from the loser's slashed stake</span>
+        <span>Arbitrator fee, paid from the loser's slashed stake and split between majority voters</span>
       </div>
       <div className="fee-line">
         <span className="fee-badge">4%</span>
         <span>Rest of the slashed stake goes to the platform</span>
       </div>
-      <p className="muted small">Winner always gets their stake back. No response in time → disputer wins by default, nobody is slashed.</p>
+      <div className="fee-line">
+        <span className="fee-badge">0.1</span>
+        <span>ETH slashed from an arbitrator's bond for voting against the majority or not voting in time</span>
+      </div>
+      <p className="muted small">
+        Winner always gets their stake back. No response in time → disputer wins by default. No 2-vote majority in time → respondent wins.
+      </p>
+    </div>
+  );
+}
+
+function ArbitratorPanel({ panel, me, act, nameOf }) {
+  const mine = panel.find((a) => a.address.toLowerCase() === me?.toLowerCase());
+  return (
+    <div className="card arb-panel">
+      <div className="card-head">
+        <h2>⚖️ Arbitrator panel</h2>
+        <span className="muted">{panel.length}/3 seats · 1 ETH bond</span>
+      </div>
+      {panel.length === 0 && <p className="muted small">No arbitrators yet — disputes need a full panel of 3.</p>}
+      {panel.map((a) => {
+        const health = Number((a.bond * 100n) / 10n ** 18n); // % of the 1 ETH bond left
+        return (
+          <div key={a.address} className={`arb ${a.address === mine?.address ? "me" : ""}`}>
+            <div className="arb-top">
+              <span>{nameOf(a.address) || short(a.address)}</span>
+              <span className="mono">{eth(a.bond, 2)} ETH</span>
+            </div>
+            <div className="bond-bar">
+              <div style={{ width: `${health}%` }} className={health < 70 ? "low" : ""} />
+            </div>
+            {a.openCases > 0 && <span className="muted small">{a.openCases} open case{a.openCases > 1 ? "s" : ""}</span>}
+          </div>
+        );
+      })}
+      <p className="muted small">Removed automatically when the bond drops below 0.5 ETH.</p>
+      {!mine && panel.length < 3 && me && (
+        <button className="btn ghost sm" onClick={() => act("Join panel", (c) => c.methods.joinPanel(), 10n ** 18n)}>
+          Join with 1 ETH bond
+        </button>
+      )}
+      {mine && (
+        <button
+          className="btn ghost sm"
+          disabled={mine.openCases > 0}
+          title={mine.openCases > 0 ? "Finish your open disputes first" : ""}
+          onClick={() => act("Leave panel", (c) => c.methods.leavePanel())}
+        >
+          Leave panel &amp; withdraw bond
+        </button>
+      )}
     </div>
   );
 }

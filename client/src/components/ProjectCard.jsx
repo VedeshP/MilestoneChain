@@ -16,7 +16,7 @@ export default function ProjectCard({ project: p, me, act, now, nameOf }) {
   const [open, setOpen] = useState(p.status === "Active" || p.status === "Disputed");
   const isClient = same(me, p.client);
   const isDev = same(me, p.developer);
-  const isArb = same(me, p.arbitrator);
+  const isArb = p.dispute.open && p.dispute.arbitrators.some((a) => same(me, a));
   const myRole = isClient ? "Client" : isDev ? "Developer" : isArb ? "Arbitrator" : null;
 
   const locked = p.totalAmount - p.releasedAmount - p.refundedAmount;
@@ -59,11 +59,14 @@ export default function ProjectCard({ project: p, me, act, now, nameOf }) {
           <div className="parties">
             <Party role="Client" addr={p.client} me={me} nameOf={nameOf} />
             <Party role="Developer" addr={p.developer} me={me} nameOf={nameOf} />
-            <Party role="Arbitrator" addr={p.arbitrator} me={me} nameOf={nameOf} />
+            <div className={`party ${isArb ? "me" : ""}`}>
+              <span className="muted small">Arbitration</span>
+              <span className="mono">⚖️ 3-member panel</span>
+            </div>
           </div>
 
           {p.dispute.open && (
-            <DisputePanel p={p} me={me} act={act} now={now} isArb={isArb} nameOf={nameOf} />
+            <DisputePanel p={p} me={me} act={act} now={now} nameOf={nameOf} />
           )}
 
           <div className="milestones">
@@ -272,13 +275,19 @@ function MilestoneRow({ p, m, isClient, isDev, act }) {
   );
 }
 
-function DisputePanel({ p, me, act, now, isArb, nameOf }) {
+const VOTE_LABEL = ["Not voted", "Developer", "Client"];
+
+function DisputePanel({ p, me, act, now, nameOf }) {
   const d = p.dispute;
   const m = p.milestones[d.milestoneIndex];
   const left = d.deadline - now;
+  const clock = `${Math.floor(Math.max(left, 0) / 60)}:${String(Math.max(left, 0) % 60).padStart(2, "0")}`;
   const isDisputer = same(me, d.disputer);
   const isRespondent = same(me, d.respondent);
   const disputerIsClient = same(d.disputer, p.client);
+  const mySeat = d.arbitrators.findIndex((a) => same(me, a));
+  const devVotes = d.votes.filter((v) => v === 1).length;
+  const clientVotes = d.votes.filter((v) => v === 2).length;
 
   const fee = pct(m.amount, PLATFORM_FEE_BPS);
   const arbFee = pct(m.amount, ARBITRATOR_FEE_BPS);
@@ -287,23 +296,25 @@ function DisputePanel({ p, me, act, now, isArb, nameOf }) {
   const outcome = (favorDeveloper) => {
     const winner = favorDeveloper ? "Developer" : "Client";
     const disputerWins = favorDeveloper !== disputerIsClient;
+    const votes = favorDeveloper ? devVotes : clientVotes;
     return (
       <div className="outcome">
         <div className="outcome-head">
-          {favorDeveloper ? "Developer wins" : "Client wins"}
-          <span className={`tag ${disputerWins ? "tone-green" : "tone-red"}`}>{disputerWins ? "disputer right" : "disputer wrong"}</span>
+          {winner} wins
+          <span className="tag tone-purple">{votes}/2 votes</span>
         </div>
         <Row k={`${winner} receives milestone`} v={`${eth(net, 6)} ETH`} />
         <Row k={`${winner} stake returned`} v={`${eth(d.stake, 6)} ETH`} />
         <Row k={`${favorDeveloper ? "Client" : "Developer"} stake slashed`} v={`−${eth(d.stake, 6)} ETH`} bad />
-        <Row k="→ Arbitrator fee (1%)" v={`${eth(arbFee, 6)} ETH`} />
+        <Row k="→ Majority arbitrators share (1%)" v={`${eth(arbFee, 6)} ETH`} />
         <Row k="→ Platform (slash rest + 0.5%)" v={`${eth(d.stake - arbFee + fee, 6)} ETH`} />
-        {isArb && d.responded && (
+        <div className="muted small outcome-note">{disputerWins ? "Disputer was right" : "Disputer was wrong"}</div>
+        {mySeat >= 0 && d.responded && d.votes[mySeat] === 0 && left > 0 && (
           <button
             className={`btn ${favorDeveloper ? "primary" : "success"} block`}
-            onClick={() => act(`Rule for ${winner}`, (c) => c.methods.resolveDispute(p.id, favorDeveloper))}
+            onClick={() => act(`Vote for ${winner}`, (c) => c.methods.vote(p.id, favorDeveloper))}
           >
-            ⚖️ Rule for {winner}
+            ⚖️ Vote for {winner}
           </button>
         )}
       </div>
@@ -320,14 +331,16 @@ function DisputePanel({ p, me, act, now, isArb, nameOf }) {
           </div>
         </div>
         <div className="dispute-clock">
-          {d.responded ? (
-            <span className="tag tone-purple">Both sides staked · awaiting arbitrator</span>
+          {!d.responded ? (
+            left > 0 ? (
+              <span className="tag tone-amber">Respondent has {clock} to counter-stake</span>
+            ) : (
+              <span className="tag tone-red">Response window closed — default win available</span>
+            )
           ) : left > 0 ? (
-            <span className="tag tone-amber">
-              Respondent has {Math.floor(left / 60)}:{String(left % 60).padStart(2, "0")} to counter-stake
-            </span>
+            <span className="tag tone-purple">Panel voting · {clock} left</span>
           ) : (
-            <span className="tag tone-red">Response window closed — default win available</span>
+            <span className="tag tone-red">Voting closed without a majority</span>
           )}
         </div>
       </div>
@@ -336,6 +349,15 @@ function DisputePanel({ p, me, act, now, isArb, nameOf }) {
         <Hash value={m.artifactHash} label="registered" />
         <Hash value={m.clientHash} label="client checked" />
         <span className="muted small">Stake per side: {eth(d.stake, 6)} ETH</span>
+      </div>
+
+      <div className="votes">
+        {d.arbitrators.map((a, i) => (
+          <div key={a} className={`vote-chip vote-${d.votes[i]} ${i === mySeat ? "me" : ""}`}>
+            <span>{nameOf(a) || short(a)}</span>
+            <b>{d.responded ? VOTE_LABEL[d.votes[i]] : "Waiting"}</b>
+          </div>
+        ))}
       </div>
 
       {isRespondent && !d.responded && left > 0 && (
@@ -356,12 +378,23 @@ function DisputePanel({ p, me, act, now, isArb, nameOf }) {
           </button>
         </div>
       )}
+      {d.responded && left <= 0 && (
+        <div className="callout">
+          <span>
+            No 2-vote majority before the deadline, so the <b>respondent wins</b>. Arbitrators who didn't vote lose 0.1 ETH of their bond.
+          </span>
+          <button className="btn primary sm" onClick={() => act("Finalize dispute", (c) => c.methods.finalizeDispute(p.id))}>
+            Finalize
+          </button>
+        </div>
+      )}
+      {mySeat >= 0 && !d.responded && <div className="muted small">You can vote once the respondent counter-stakes.</div>}
+      {mySeat >= 0 && d.responded && d.votes[mySeat] !== 0 && <div className="muted small">Your vote is in — waiting for the others.</div>}
 
       <div className="outcomes">
         {outcome(true)}
         {outcome(false)}
       </div>
-      {isArb && !d.responded && <div className="muted small">You can rule once the respondent counter-stakes.</div>}
     </div>
   );
 }

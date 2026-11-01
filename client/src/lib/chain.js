@@ -1,7 +1,7 @@
 import Web3 from "web3";
 import artifact from "../contracts/MilestoneEscrow.json";
 
-export const GANACHE_URL = "http://127.0.0.1:7545";
+export const GANACHE_URL = import.meta.env.VITE_RPC_URL || "http://127.0.0.1:7545";
 
 export const PROJECT_STATUS = ["Active", "Completed", "Disputed", "Cancelled"];
 export const MILESTONE_STATUS = ["Pending", "Submitted", "Verified", "Approved", "Disputed", "Refunded"];

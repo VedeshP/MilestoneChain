@@ -7,6 +7,8 @@ module.exports = {
   networks: {
     // Ganache GUI (default port 7545) or `npm run ganache`
     development: { host: "127.0.0.1", port: 7545, network_id: "*" },
+    // Throwaway chain for tests so they do not clutter the Ganache app (npm run ganache:test, then npm run test:cli)
+    test: { host: "127.0.0.1", port: 8545, network_id: "*" },
   },
 
   compilers: {
